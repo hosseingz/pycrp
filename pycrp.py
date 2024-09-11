@@ -64,6 +64,41 @@ class Crp:
         else:
             raise ValueError('Encrypt a file before dumping it.')
     
+
+    def load_crp(self, path:str):
+        if not path:
+            raise ValueError("Path cannot be empty.")
+
+        if os.path.isfile(path) and os.path.exists(path) and path.endswith('.crp'):
+            
+            with open(path, 'rb') as file:
+                data = self.decrypt(file.read())
+            
+            self.__dcrp = pickle.loads(data)
+        
+        else:
+            raise FileNotFoundError('File is not exists or File is not a CRP file') 
+ 
+    def dump_file(self, file_name:str=None, export_dir_path:str=None):
+        if hasattr(self, '__dcrp'):
+            try:
+                if not file_name:
+                    file_name = self.__dcrp['file_name']
+
+                if not (export_dir_path and os.path.isdir(export_dir_path)):
+                    print(colored(f'This Dir does not exist !. File will be saved in "files/"', 'red'))
+                    export_dir_path = self.__ensure_dir_exists('files/')
+
+                path = os.path.join(export_dir_path, file_name)
+
+                with open(path, 'wb') as file:
+                    file.write(self.__dcrp['data'])
+                
+            except Exception as e:
+                print(f'Error: {e}')
+        else:
+            raise ValueError('Decrypt a file before dumping it.')
+ 
     
     def __ensure_dir_exists(self, path:str):
         
