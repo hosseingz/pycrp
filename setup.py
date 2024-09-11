@@ -13,6 +13,9 @@ setup(
         'cryptography==42.0.8',
         'termcolor==2.4.0',
 	], 
-    
-
+    entry_points = {
+        'console_scripts': [
+            'pycrp=pycrp.cli:commands'
+        ]
+    },
 ) 
