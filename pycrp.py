@@ -38,18 +38,20 @@ class Crp:
         
         
         with open(path, 'rb') as file:
-            self.__crp = {
+            self._crp = {
                 'file_name': os.path.basename(path),
                 'data': file.read(),
             }
     
     def dump_crp(self, file_name:str=None, export_dir_path:str=None):
-        if hasattr(self, '__crp'):
+        if hasattr(self, '_crp'):
             if file_name:
                 baseName, currentEx = os.path.splitext(file_name)
                 
                 if currentEx != '.crp':
                     file_name = f'{baseName}.crp'
+            else:
+                file_name = f"{os.path.splitext(self._crp['file_name'])[0]}.crp"
 
             if not (export_dir_path and os.path.isdir(export_dir_path)):
                 print(colored(f'This Dir does not exist !. File will be saved in "crp-files/"', 'red'))
@@ -57,7 +59,7 @@ class Crp:
                 
                 
             path = os.path.join(export_dir_path, file_name)
-            data = self.encrypt( pickle.dumps(self.__crp) )
+            data = self.encrypt( pickle.dumps(self._crp) )
             
             with open(path, 'wb') as file:
                 file.write(data)
@@ -74,16 +76,16 @@ class Crp:
             with open(path, 'rb') as file:
                 data = self.decrypt(file.read())
             
-            self.__dcrp = pickle.loads(data)
+            self._dcrp = pickle.loads(data)
         
         else:
             raise FileNotFoundError('File is not exists or File is not a CRP file') 
  
     def dump_file(self, file_name:str=None, export_dir_path:str=None):
-        if hasattr(self, '__dcrp'):
+        if hasattr(self, '_dcrp'):
             try:
                 if not file_name:
-                    file_name = self.__dcrp['file_name']
+                    file_name = self._dcrp['file_name']
 
                 if not (export_dir_path and os.path.isdir(export_dir_path)):
                     print(colored(f'This Dir does not exist !. File will be saved in "files/"', 'red'))
@@ -92,7 +94,7 @@ class Crp:
                 path = os.path.join(export_dir_path, file_name)
 
                 with open(path, 'wb') as file:
-                    file.write(self.__dcrp['data'])
+                    file.write(self._dcrp['data'])
                 
             except Exception as e:
                 print(f'Error: {e}')
