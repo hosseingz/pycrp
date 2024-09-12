@@ -1,4 +1,4 @@
-from cryptography.fernet import InvalidToken
+from exceptions import InvalidKey
 from termcolor import colored
 from pycrp import Crp
 import click
@@ -68,7 +68,7 @@ def dec(key, dir, export):
             path = crp.dump_file(export_dir_path=export)
             
             click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
-        except ValueError:
+        except InvalidKey:
             click.echo(f'{file}: {colored("Invalid Key for this file !", "red")}')
         except FileNotFoundError:
             click.echo(f'{file}: {colored("Not Found or Not a Crp File !", "red")}')

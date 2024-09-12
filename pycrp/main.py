@@ -2,6 +2,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from base64 import b64encode
 from hashlib import sha256
 
+from exceptions import InvalidKey
+
 import os
 import pickle
 
@@ -69,7 +71,7 @@ class Crp:
             return self.__f.decrypt(data)
 
         except InvalidToken:
-            raise ValueError('Invalid Key !')
+            raise InvalidKey('Invalid Key !')
 
 
     
@@ -194,7 +196,7 @@ class Crp:
         else:
             raise ValueError('Decrypt a file before dumping it.')
  
-    
+    @classmethod
     def __ensure_dir_exists(self, path:str):
         """
         Ensures that a directory exists; if not, creates it.
