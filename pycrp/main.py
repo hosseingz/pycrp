@@ -2,7 +2,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from base64 import b64encode
 from hashlib import sha256
 
-from exceptions import InvalidKey
+from .exceptions import InvalidKey
 
 import os
 import pickle

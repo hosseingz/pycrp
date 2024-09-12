@@ -1,6 +1,10 @@
 from setuptools import setup, find_packages
 
 
+with open('README.md', 'r', encoding='utf8') as f:
+    description = f.read()
+
+
 setup( 
 	name='pycrp', 
 	version='1.0.0', 
@@ -18,4 +22,8 @@ setup(
             'pycrp=pycrp.cli:commands'
         ]
     },
+    
+    long_description=description,
+    long_description_content_type='text/markdown'
+    
 ) 

@@ -1,4 +1,4 @@
-from exceptions import InvalidKey
+from .exceptions import InvalidKey
 from termcolor import colored
 from pycrp import Crp
 import click
