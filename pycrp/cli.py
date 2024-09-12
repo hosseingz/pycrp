@@ -1,3 +1,4 @@
+from cryptography.fernet import InvalidToken
 from termcolor import colored
 from pycrp import Crp
 import click
@@ -32,10 +33,14 @@ def enc(key, dir, export):
         
         try:
             crp.load_file(path)
-            crp.dump_crp(export_dir_path=export)
+            path = crp.dump_crp(export_dir_path=export)
+            
+            click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
+            
         except FileNotFoundError:
-            print(f'{file}: {colored("Not Found !", "red")}')
+            click.echo(f'{file}: {colored("Not Found !", "red")}')
 
+ 
  
 
 @click.command()
@@ -60,9 +65,13 @@ def dec(key, dir, export):
         path = os.path.join(dir if dir is not None else '.', file)
         try:
             crp.load_crp(path)
-            crp.dump_file(export_dir_path=export)
+            path = crp.dump_file(export_dir_path=export)
+            
+            click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
+        except ValueError:
+            click.echo(f'{file}: {colored("Invalid Key for this file !", "red")}')
         except FileNotFoundError:
-            print(f'{file}: {colored("Not Found or Not a Crp File !", "red")}')
+            click.echo(f'{file}: {colored("Not Found or Not a Crp File !", "red")}')
 
 
 commands.add_command(enc)

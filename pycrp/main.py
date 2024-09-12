@@ -1,7 +1,6 @@
 from cryptography.fernet import Fernet, InvalidToken
 from base64 import b64encode
 from hashlib import sha256
-from termcolor import colored
 
 import os
 import pickle
@@ -68,9 +67,11 @@ class Crp:
         
         try:
             return self.__f.decrypt(data)
+
         except InvalidToken:
-            print(colored('Invalid Key !', 'red'))
-        
+            raise ValueError('Invalid Key !')
+
+
     
     
     def load_file(self, path:str):
@@ -83,7 +84,7 @@ class Crp:
 
         Raises:
             ValueError: If the file path is empty.
-            FileNotFoundError: If the specified file does not exist.
+            FileNotFoundError: If the specified file does not exist or is not a file.
         """
         
         if not path:
@@ -130,7 +131,8 @@ class Crp:
             with open(path, 'wb') as file:
                 file.write(data)
                 
-            print(colored(f'{file_name} saved in "{export_dir_path}"', 'green'))
+            
+            return path
         else:
             raise ValueError('Encrypt a file before dumping it.')
     
@@ -185,7 +187,7 @@ class Crp:
                 with open(path, 'wb') as file:
                     file.write(self._dcrp['data'])
                     
-                print(colored(f'{file_name} saved in "{export_dir_path}"', 'green'))
+                return path
                 
             except Exception as e:
                 print(f'Error: {e}')

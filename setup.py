@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup( 
 	name='pycrp', 
-	version='1', 
+	version='1.0.0', 
 	description='A Python package for securely encrypting and decrypting files with advanced algorithms.', 
 	author='Hossein gasemzadeh', 
 	author_email='hossein.gasemzadeh03@gmail.com', 
