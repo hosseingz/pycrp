@@ -123,8 +123,11 @@ class Crp:
             else:
                 file_name = f"{os.path.splitext(self._crp['file_name'])[0]}.crp"
 
-            if not (export_dir_path and os.path.isdir(export_dir_path)):
+
+            if not export_dir_path:
                 export_dir_path = self.__ensure_dir_exists('crp-files/')
+            else:
+                export_dir_path = self.__ensure_dir_exists(export_dir_path)
                 
                 
             path = os.path.join(export_dir_path, file_name)
@@ -207,7 +210,10 @@ class Crp:
         Returns:
             str: The path that has been ensured to exist.
         """
-        if not os.path.exists(path):
-            os.makedirs(path)
-        
-        return path
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path)
+            
+            return path
+        except FileExistsError:
+            return path

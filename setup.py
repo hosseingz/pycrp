@@ -7,7 +7,7 @@ with open('README.md', 'r', encoding='utf8') as f:
 
 setup( 
 	name='pycrp', 
-	version='1.0.0', 
+	version='1.0.1', 
 	description='A Python package for securely encrypting and decrypting files with advanced algorithms.', 
 	author='Hossein gasemzadeh', 
 	author_email='hossein.gasemzadeh03@gmail.com', 
