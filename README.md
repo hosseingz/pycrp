@@ -72,12 +72,28 @@ The `Crp` class provides all the core functionality:
 - **`load_crp(path: str)`**: Loads and decrypts a `.crp` file.
 - **`dump_file(file_name: str = None, export_dir_path: str = None)`**: Saves the decrypted data to a file.
 
+### Example Usage in Python 🐍
 
-### CLI Commands
+Here's how to use the `Crp` class in your Python code for encrypting and decrypting a file:
 
-- **`enc`**: Encrypt files in a directory.
-- **`dec`**: Decrypt `.crp` files in a directory.
+```python
+from your_module import Crp  # Replace 'your_module' with the actual module name
 
+# Initialize with an encryption key
+key = "my-secret-key"
+crp = Crp(key)
+
+# Encrypt a file
+file_path = "path/to/your/file.txt"
+crp.load_file(file_path)
+encrypted_path = crp.dump_crp(export_dir_path="encrypted_files")
+print(f"File encrypted and saved to {encrypted_path}")
+
+# Decrypt the previously encrypted file
+crp.load_crp(encrypted_path)
+decrypted_path = crp.dump_file(export_dir_path="decrypted_files")
+print(f"File decrypted and saved to {decrypted_path}")
+```
 
 ## Contributing 🤝
 
