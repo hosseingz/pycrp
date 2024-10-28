@@ -77,7 +77,7 @@ The `Crp` class provides all the core functionality:
 Here's how to use the `Crp` class in your Python code for encrypting and decrypting a file:
 
 ```python
-from your_module import Crp  # Replace 'your_module' with the actual module name
+from pycrp import Crp
 
 # Initialize with an encryption key
 key = "my-secret-key"
