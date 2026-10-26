@@ -1,4 +1,4 @@
-from .exceptions import InvalidKey
+from .exceptions import InvalidKey, CorruptedFile, UnsupportedVersion
 from termcolor import colored
 from pycrp import Crp
 import click
@@ -70,6 +70,8 @@ def dec(key, dir, export):
             click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
         except InvalidKey:
             click.echo(f'{file}: {colored("Invalid Key for this file !", "red")}')
+        except (CorruptedFile, UnsupportedVersion) as e:
+            click.echo(f'{file}: {colored(f"Corrupted or unsupported .crp file ({e})", "red")}')
         except FileNotFoundError:
             click.echo(f'{file}: {colored("Not Found or Not a Crp File !", "red")}')
 
