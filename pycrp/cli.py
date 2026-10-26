@@ -32,8 +32,7 @@ def enc(key, dir, export):
         path = os.path.join(dir if dir is not None else '.', file)
         
         try:
-            crp.load_file(path)
-            path = crp.dump_crp(export_dir_path=export)
+            path = crp.encrypt_file(path, export_dir_path=export)
             
             click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
             
@@ -64,8 +63,7 @@ def dec(key, dir, export):
     for file in files:
         path = os.path.join(dir if dir is not None else '.', file)
         try:
-            crp.load_crp(path)
-            path = crp.dump_file(export_dir_path=export)
+            path = crp.decrypt_file(path, export_dir_path=export)
             
             click.echo(f"{file}: {colored('saved', 'green')} -> {path}")
         except InvalidKey:

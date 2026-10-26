@@ -1,44 +1,111 @@
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet, InvalidToken
 from base64 import urlsafe_b64encode
 
 from .exceptions import InvalidKey, CorruptedFile, UnsupportedVersion
 from .constants import (
-    MAGIC, VERSION, SALT_SIZE, KEY_LEN,
-    SCRYPT_N, SCRYPT_R, SCRYPT_P, HEADER_SIZE,
+    MAGIC, VERSION_LEGACY, VERSION_STREAM,
+    SALT_SIZE, KEY_LEN, SCRYPT_N, SCRYPT_R, SCRYPT_P,
+    HEADER_SIZE_V1, HEADER_SIZE_V2,
+    NONCE_PREFIX_SIZE, CHUNK_LEN_FIELD_SIZE,
+    DEFAULT_CHUNK_SIZE, READ_BLOCK_SIZE, MAX_CHUNK_INDEX,
 )
 
 import os
 import struct
+import zlib
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
     """
-    Derives a Fernet-compatible key (32 url-safe-base64-encoded bytes) from a
-    password and a salt using scrypt, a memory-hard KDF. This replaces the
-    previous single-pass sha256(password) scheme, which had no salt and was
-    cheap to brute-force or precompute (rainbow tables / GPU cracking).
+    Derives a raw KEY_LEN-byte key from a password and a salt using scrypt,
+    a memory-hard KDF. Used directly as the AES-256-GCM key for the current
+    streaming format.
     """
     kdf = Scrypt(salt=salt, length=KEY_LEN, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
-    raw_key = kdf.derive(password.encode('utf-8'))
-    return urlsafe_b64encode(raw_key)
+    return kdf.derive(password.encode('utf-8'))
+
+
+def _pack_metadata(file_name: str) -> bytes:
+    name_bytes = file_name.encode('utf-8')
+    if len(name_bytes) > 0xFFFF:
+        raise ValueError('File name is too long to be stored.')
+    return struct.pack('>H', len(name_bytes)) + name_bytes
+
+
+class _ChunkedByteReader:
+    """
+    Wraps an iterable of bytes (of any size) and re-chunks it into
+    fixed-size pieces of at most `chunk_size` bytes, each tagged with
+    whether it is the final piece. Memory use is bounded by chunk_size
+    regardless of how much data the source iterable eventually produces.
+    """
+
+    def __init__(self, source, chunk_size: int):
+        self._source = iter(source)
+        self._chunk_size = chunk_size
+        self._buf = bytearray()
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while len(self._buf) < self._chunk_size and not self._done:
+            try:
+                self._buf.extend(next(self._source))
+            except StopIteration:
+                self._done = True
+
+        if not self._buf and self._done:
+            raise StopIteration
+
+        take = min(self._chunk_size, len(self._buf))
+        chunk = bytes(self._buf[:take])
+        del self._buf[:take]
+        is_last = self._done and not self._buf
+        return chunk, is_last
+
+
+def _raw_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE):
+    """Yields metadata first, then the source file's content in fixed-size blocks."""
+    yield metadata
+    with open(path, 'rb') as file:
+        while True:
+            block = file.read(read_block)
+            if not block:
+                break
+            yield block
+
+
+def _compressed_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE):
+    """Like `_raw_source`, but streamed through a zlib compressor as it is read."""
+    compressor = zlib.compressobj()
+    for block in _raw_source(path, metadata, read_block):
+        data = compressor.compress(block)
+        if data:
+            yield data
+    tail = compressor.flush()
+    if tail:
+        yield tail
 
 
 class Crp:
     """
-    A class that provides methods for encrypting and decrypting files using
-    Fernet symmetric encryption, with a random salt per operation and a
-    scrypt-derived key (instead of a bare sha256 hash of the password).
+    Encrypts/decrypts files with AES-256-GCM in fixed-size, independently
+    authenticated chunks, so memory use stays bounded (roughly one chunk)
+    regardless of file size, instead of loading the whole file into RAM.
 
-    Container format, see constants.py for details:
-        MAGIC(4) + VERSION(1) + SALT(16) + FERNET_TOKEN(...)
+    An optional zlib compression pass runs on the plaintext stream, before
+    chunking and encryption, to shrink the ciphertext and reduce plaintext
+    redundancy.
 
-    The previous implementation stored file metadata (name + bytes) with
-    `pickle`, which allows arbitrary code execution if a malicious/corrupted
-    .crp file is ever loaded. This version replaces pickle with a tiny,
-    fixed binary layout (2-byte filename length + utf-8 filename + raw
-    bytes) that is encrypted inside the Fernet token, so loading a .crp file
-    can no longer execute attacker-controlled code.
+    See constants.py for the exact on-disk layout of both the legacy
+    (task 1, whole-file Fernet) and current (task 2, streaming) formats.
+    `decrypt_file` transparently supports both; `encrypt_file` only ever
+    writes the current streaming format.
     """
 
     def __init__(self, key: str):
@@ -51,223 +118,290 @@ class Crp:
         Raises:
             ValueError: If the provided key is empty.
         """
-
         if not key:
             raise ValueError("An empty key is not Valid input.")
 
-        # The raw password is kept (not pre-hashed) because each encrypt()
-        # call derives its own key from a fresh random salt.
         self.__key = key
 
-    def __fernet_for_salt(self, salt: bytes) -> Fernet:
-        return Fernet(_derive_key(self.__key, salt))
+    # Encryption (streaming, v2)
 
-    def encrypt(self, data: bytes) -> bytes:
+    def encrypt_file(
+        self,
+        path: str,
+        export_dir_path: str = None,
+        file_name: str = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        compress: bool = True,
+    ) -> str:
         """
-        Encrypts the given byte data with a freshly generated random salt.
+        Streams, (optionally) compresses, and encrypts a file into a .crp
+        container without loading the whole file into memory.
 
         Args:
-            data (bytes): The data to be encrypted.
+            path (str): Path of the file to encrypt.
+            export_dir_path (str, optional): Directory to write the .crp file
+                into. Defaults to 'crp-files/'.
+            file_name (str, optional): Name to give the .crp file. Defaults to
+                the source file's name with a .crp extension.
+            chunk_size (int, optional): Target plaintext chunk size, in bytes,
+                before each chunk is encrypted. Defaults to 1 MiB.
+            compress (bool, optional): Whether to zlib-compress the data
+                before encrypting it. Defaults to True.
 
         Returns:
-            bytes: MAGIC + VERSION + SALT + Fernet token.
+            str: The path of the written .crp file.
 
         Raises:
-            ValueError: If the provided data is empty.
-        """
-
-        if not data:
-            raise ValueError('Data cannot be empty.')
-
-        salt = os.urandom(SALT_SIZE)
-        token = self.__fernet_for_salt(salt).encrypt(data)
-
-        return MAGIC + bytes([VERSION]) + salt + token
-
-    def decrypt(self, data: bytes) -> bytes:
-        """
-        Decrypts data produced by `encrypt`.
-
-        Args:
-            data (bytes): The data to be decrypted.
-
-        Returns:
-            bytes: The decrypted data.
-
-        Raises:
-            ValueError: If the provided data is empty.
-            CorruptedFile: If the data is too short or has a bad magic header.
-            UnsupportedVersion: If the data was produced by an incompatible format version.
-            InvalidKey: If the key is wrong or the data has been tampered with.
-        """
-
-        if not data:
-            raise ValueError('Data cannot be empty.')
-
-        if len(data) < HEADER_SIZE:
-            raise CorruptedFile('File is too short to be a valid .crp file.')
-
-        if data[:len(MAGIC)] != MAGIC:
-            raise CorruptedFile('Not a valid .crp file (bad magic bytes).')
-
-        offset = len(MAGIC)
-        version = data[offset]
-        offset += 1
-        if version != VERSION:
-            raise UnsupportedVersion(f'Unsupported .crp format version: {version}')
-
-        salt = data[offset:offset + SALT_SIZE]
-        offset += SALT_SIZE
-        token = data[offset:]
-
-        try:
-            return self.__fernet_for_salt(salt).decrypt(token)
-        except InvalidToken:
-            raise InvalidKey('Invalid Key !')
-
-    def load_file(self, path: str):
-        """
-        This function reads the file data and prepares it for subsequent encryption operations.
-        It raises an error if the provided file path is invalid or if the file does not exist.
-
-        Args:
-            path (str): The path to the file to be loaded.
-
-        Raises:
-            ValueError: If the file path is empty.
-            FileNotFoundError: If the specified file does not exist or is not a file.
+            ValueError: If the path is empty, the file does not exist, or
+                chunk_size is not a positive integer.
         """
 
         if not path:
             raise ValueError("File path cannot be empty.")
 
-        elif os.path.exists(path) and not os.path.isfile(path):
+        if os.path.exists(path) and not os.path.isfile(path):
             raise FileNotFoundError('The file does not exist.')
 
-        with open(path, 'rb') as file:
-            self._crp = {
-                'file_name': os.path.basename(path),
-                'data': file.read(),
-            }
+        if chunk_size <= 0:
+            raise ValueError('chunk_size must be a positive integer.')
 
-    def dump_crp(self, file_name: str = None, export_dir_path: str = None):
-        """
-        Saves the encrypted file data to a .crp file.
-
-        Args:
-            file_name (str, optional): The desired name of the output file. If None, the original file name will be used.
-            export_dir_path (str, optional): The directory path where the file will be saved. If None, defaults to 'crp-files/'.
-
-        Raises:
-            ValueError: If no file has been loaded for encryption.
-        """
-
-        if not hasattr(self, '_crp'):
-            raise ValueError('Encrypt a file before dumping it.')
+        source_name = os.path.basename(path)
 
         if file_name:
-            baseName, currentEx = os.path.splitext(file_name)
-
-            if currentEx != '.crp':
-                file_name = f'{baseName}.crp'
+            base_name, current_ext = os.path.splitext(file_name)
+            if current_ext != '.crp':
+                file_name = f'{base_name}.crp'
         else:
-            file_name = f"{os.path.splitext(self._crp['file_name'])[0]}.crp"
+            file_name = f"{os.path.splitext(source_name)[0]}.crp"
 
-        if not export_dir_path:
-            export_dir_path = self.__ensure_dir_exists('crp-files/')
-        else:
-            export_dir_path = self.__ensure_dir_exists(export_dir_path)
+        export_dir_path = self.__ensure_dir_exists(export_dir_path or 'crp-files/')
+        out_path = os.path.join(export_dir_path, file_name)
 
-        path = os.path.join(export_dir_path, file_name)
+        salt = os.urandom(SALT_SIZE)
+        nonce_prefix = os.urandom(NONCE_PREFIX_SIZE)
+        key = _derive_key(self.__key, salt)
+        aead = AESGCM(key)
 
-        # Binary metadata header (replaces pickle): 2-byte big-endian
-        # filename length, the utf-8 filename, then the raw file bytes.
-        # This whole payload is encrypted together, so the filename stays
-        # confidential too.
-        original_name = self._crp['file_name'].encode('utf-8')
-        if len(original_name) > 0xFFFF:
-            raise ValueError('File name is too long to be stored.')
+        metadata = _pack_metadata(source_name)
+        source = _compressed_source(path, metadata) if compress else _raw_source(path, metadata)
 
-        payload = struct.pack('>H', len(original_name)) + original_name + self._crp['data']
-        data = self.encrypt(payload)
+        with open(out_path, 'wb') as out:
+            out.write(MAGIC)
+            out.write(bytes([VERSION_STREAM]))
+            out.write(salt)
+            out.write(nonce_prefix)
+            out.write(struct.pack('>I', chunk_size))
+            out.write(bytes([1 if compress else 0]))
 
-        with open(path, 'wb') as file:
-            file.write(data)
+            for index, (chunk, is_last) in enumerate(_ChunkedByteReader(source, chunk_size)):
+                if index > MAX_CHUNK_INDEX:
+                    raise ValueError('File is too large for the current chunk size.')
 
-        return path
+                nonce = nonce_prefix + struct.pack('>I', index)
+                aad = struct.pack('>I?', index, is_last)
+                ciphertext = aead.encrypt(nonce, chunk, aad)
 
-    def load_crp(self, path: str):
+                out.write(struct.pack('>I', len(ciphertext)))
+                out.write(ciphertext)
+
+        return out_path
+
+    # Decryption (supports both v1 legacy and v2 streaming)
+    def decrypt_file(
+        self,
+        path: str,
+        export_dir_path: str = None,
+        file_name: str = None,
+    ) -> str:
         """
-        Loads and decrypts a .crp file to retrieve its original content.
+        Streams and decrypts a .crp file back to its original content
+        without loading the whole file into memory (for v2 containers;
+        legacy v1 containers are still loaded whole, as they always were).
 
         Args:
-            path (str): The path to the .crp file to be loaded.
+            path (str): Path to the .crp file.
+            export_dir_path (str, optional): Directory to write the decrypted
+                file into. Defaults to 'files/'.
+            file_name (str, optional): Name to give the decrypted file.
+                Defaults to the name stored inside the .crp file.
+
+        Returns:
+            str: The path of the written, decrypted file.
 
         Raises:
-            ValueError: If the provided path is empty.
-            FileNotFoundError: If the file does not exist or is not a .crp file.
-            CorruptedFile: If the file content is not a valid .crp container.
-            UnsupportedVersion: If the file was produced by an incompatible format version.
-            InvalidKey: If the key is wrong.
+            ValueError: If the path is empty.
+            FileNotFoundError: If the file does not exist or isn't a .crp file.
+            CorruptedFile: If the container is malformed or truncated.
+            UnsupportedVersion: If the format version is not recognized.
+            InvalidKey: If the key is wrong or the data has been tampered with.
         """
 
         if not path:
             raise ValueError("Path cannot be empty.")
 
-        if os.path.isfile(path) and path.endswith('.crp'):
-
-            with open(path, 'rb') as file:
-                payload = self.decrypt(file.read())
-
-            if len(payload) < 2:
-                raise CorruptedFile('Decrypted payload is malformed.')
-
-            name_len = struct.unpack('>H', payload[:2])[0]
-            if len(payload) < 2 + name_len:
-                raise CorruptedFile('Decrypted payload is malformed.')
-
-            file_name = payload[2:2 + name_len].decode('utf-8')
-            data = payload[2 + name_len:]
-
-            self._dcrp = {
-                'file_name': file_name,
-                'data': data,
-            }
-
-        else:
+        if not (os.path.isfile(path) and path.endswith('.crp')):
             raise FileNotFoundError('File is not exists or File is not a CRP file')
 
-    def dump_file(self, file_name: str = None, export_dir_path: str = None):
+        with open(path, 'rb') as inp:
+            magic = inp.read(len(MAGIC))
+            if magic != MAGIC:
+                raise CorruptedFile('Not a valid .crp file (bad magic bytes).')
+
+            version_byte = inp.read(1)
+            if len(version_byte) != 1:
+                raise CorruptedFile('File is too short to be a valid .crp file.')
+            version = version_byte[0]
+
+            if version == VERSION_LEGACY:
+                decrypted_name, data = self.__decrypt_legacy_v1(inp)
+            elif version == VERSION_STREAM:
+                decrypted_name, data_iter = self.__open_stream_v2(inp)
+                data = None  # written straight to disk below
+            else:
+                raise UnsupportedVersion(f'Unsupported .crp format version: {version}')
+
+            final_name = file_name or decrypted_name
+            export_dir_path = self.__ensure_dir_exists(export_dir_path or 'files/')
+            out_path = os.path.join(export_dir_path, final_name)
+
+            with open(out_path, 'wb') as out:
+                if data is not None:
+                    out.write(data)
+                else:
+                    for block in data_iter:
+                        out.write(block)
+
+        return out_path
+
+    # v2 (streaming) decryption internals
+    def __open_stream_v2(self, inp):
         """
-        Saves the decrypted file data to the specified output path.
-
-        Args:
-            file_name (str, optional): The desired name for the output file. Defaults to the original file name if None.
-            export_dir_path (str, optional): The directory path where the file will be saved. If None, defaults to 'files/'.
-
-        Raises:
-            ValueError: If no file has been decrypted for dumping.
+        Parses a v2 header from an already-open file object positioned right
+        after the version byte, and returns (file_name, data_blocks_iterator).
+        The iterator yields decrypted (and decompressed, if applicable)
+        plaintext blocks lazily, so the caller can write them straight to
+        disk without buffering the whole file.
         """
 
-        if hasattr(self, '_dcrp'):
-            try:
-                if not file_name:
-                    file_name = self._dcrp['file_name']
+        rest_of_header = inp.read(HEADER_SIZE_V2 - len(MAGIC) - 1)
+        if len(rest_of_header) != HEADER_SIZE_V2 - len(MAGIC) - 1:
+            raise CorruptedFile('File is too short to be a valid .crp file.')
 
-                if not (export_dir_path and os.path.isdir(export_dir_path)):
-                    export_dir_path = self.__ensure_dir_exists('files/')
+        offset = 0
+        salt = rest_of_header[offset:offset + SALT_SIZE]
+        offset += SALT_SIZE
+        nonce_prefix = rest_of_header[offset:offset + NONCE_PREFIX_SIZE]
+        offset += NONCE_PREFIX_SIZE
+        chunk_size = struct.unpack('>I', rest_of_header[offset:offset + 4])[0]
+        offset += 4
+        compressed = bool(rest_of_header[offset])
 
-                path = os.path.join(export_dir_path, file_name)
+        key = _derive_key(self.__key, salt)
+        aead = AESGCM(key)
 
-                with open(path, 'wb') as file:
-                    file.write(self._dcrp['data'])
+        name_box = {'name': None}
 
-                return path
+        def plaintext_blocks():
+            decompressor = zlib.decompressobj() if compressed else None
+            index = 0
+            header_buf = bytearray()
+            header_done = False
 
-            except Exception as e:
-                print(f'Error: {e}')
-        else:
-            raise ValueError('Decrypt a file before dumping it.')
+            len_bytes = inp.read(CHUNK_LEN_FIELD_SIZE)
+            while len_bytes:
+                if len(len_bytes) != CHUNK_LEN_FIELD_SIZE:
+                    raise CorruptedFile('Truncated chunk length header.')
+
+                clen = struct.unpack('>I', len_bytes)[0]
+                ciphertext = inp.read(clen)
+                if len(ciphertext) != clen:
+                    raise CorruptedFile('Truncated chunk data.')
+
+                next_len_bytes = inp.read(CHUNK_LEN_FIELD_SIZE)
+                is_last = len(next_len_bytes) == 0
+                if 0 < len(next_len_bytes) < CHUNK_LEN_FIELD_SIZE:
+                    raise CorruptedFile('Truncated chunk length header.')
+
+                nonce = nonce_prefix + struct.pack('>I', index)
+                aad = struct.pack('>I?', index, is_last)
+
+                try:
+                    plain = aead.decrypt(nonce, ciphertext, aad)
+                except InvalidTag:
+                    raise InvalidKey('Invalid Key !')
+
+                if decompressor is not None:
+                    plain = decompressor.decompress(plain)
+                    if is_last:
+                        plain += decompressor.flush()
+
+                if not header_done:
+                    header_buf.extend(plain)
+                    if len(header_buf) >= 2:
+                        name_len = struct.unpack('>H', header_buf[:2])[0]
+                        if len(header_buf) >= 2 + name_len:
+                            name_box['name'] = header_buf[2:2 + name_len].decode('utf-8')
+                            header_done = True
+                            remainder = bytes(header_buf[2 + name_len:])
+                            if remainder:
+                                yield remainder
+                    if not header_done:
+                        index += 1
+                        len_bytes = next_len_bytes
+                        continue
+                else:
+                    yield plain
+
+                index += 1
+                len_bytes = next_len_bytes
+
+            if not header_done:
+                raise CorruptedFile('Decrypted payload is malformed.')
+
+        blocks = plaintext_blocks()
+        first_block = next(blocks, b'')
+
+        def chained():
+            if first_block:
+                yield first_block
+            yield from blocks
+
+        # Force header parsing (it happens lazily on first `next()`) before
+        # returning, so `name_box['name']` is populated for the caller.
+        return name_box['name'], chained()
+
+    # v1 (legacy, whole-file) decryption internals
+    def __decrypt_legacy_v1(self, inp):
+        """
+        Decrypts a legacy (task 1) whole-file Fernet container. Reads the
+        rest of the file into memory, since that format predates chunking.
+        """
+
+        rest_of_header = inp.read(HEADER_SIZE_V1 - len(MAGIC) - 1)
+        if len(rest_of_header) != SALT_SIZE:
+            raise CorruptedFile('File is too short to be a valid .crp file.')
+
+        salt = rest_of_header
+        token = inp.read()
+
+        raw_key = _derive_key(self.__key, salt)
+        fernet_key = urlsafe_b64encode(raw_key)
+
+        try:
+            payload = Fernet(fernet_key).decrypt(token)
+        except InvalidToken:
+            raise InvalidKey('Invalid Key !')
+
+        if len(payload) < 2:
+            raise CorruptedFile('Decrypted payload is malformed.')
+
+        name_len = struct.unpack('>H', payload[:2])[0]
+        if len(payload) < 2 + name_len:
+            raise CorruptedFile('Decrypted payload is malformed.')
+
+        file_name = payload[2:2 + name_len].decode('utf-8')
+        data = payload[2 + name_len:]
+        return file_name, data
 
     @classmethod
     def __ensure_dir_exists(cls, path: str):
