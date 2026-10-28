@@ -13,6 +13,7 @@ from .constants import (
     DEFAULT_CHUNK_SIZE, READ_BLOCK_SIZE, MAX_CHUNK_INDEX,
 )
 
+from pathlib import PurePosixPath
 import os
 import struct
 import zlib
@@ -28,11 +29,40 @@ def _derive_key(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode('utf-8'))
 
 
-def _pack_metadata(file_name: str) -> bytes:
-    name_bytes = file_name.encode('utf-8')
+def _pack_metadata(stored_name: str) -> bytes:
+    name_bytes = stored_name.replace(os.sep, '/').encode('utf-8')
     if len(name_bytes) > 0xFFFF:
         raise ValueError('File name is too long to be stored.')
     return struct.pack('>H', len(name_bytes)) + name_bytes
+
+
+def _safe_join(base_dir: str, stored_name: str) -> str:
+    """
+    Resolves the name embedded in a .crp container against `base_dir`,
+    rejecting anything that would land outside it.
+
+    Stored names are always posix-style (forward slashes), including for
+    files encrypted on Windows, so a directory tree round-trips the same
+    way regardless of platform. A name is rejected if it is empty, is
+    absolute, or contains a '..' segment; the resolved path is then
+    checked against `base_dir` a second time with realpath, which also
+    catches a '..' hidden behind a symlink.
+    """
+    if not stored_name:
+        raise CorruptedFile('Stored file name is empty.')
+
+    parts = PurePosixPath(stored_name).parts
+    if not parts or any(part in ('..', '.', '') for part in parts) or PurePosixPath(stored_name).is_absolute():
+        raise CorruptedFile(f'Stored file name is not a safe relative path: {stored_name!r}')
+
+    candidate = os.path.join(base_dir, *parts)
+
+    base_real = os.path.realpath(base_dir)
+    candidate_real = os.path.realpath(candidate)
+    if os.path.commonpath([base_real, candidate_real]) != base_real:
+        raise CorruptedFile(f'Stored file name escapes the export directory: {stored_name!r}')
+
+    return candidate
 
 
 class _ChunkedByteReader:
@@ -106,6 +136,11 @@ class Crp:
     (task 1, whole-file Fernet) and current (task 2, streaming) formats.
     `decrypt_file` transparently supports both; `encrypt_file` only ever
     writes the current streaming format.
+
+    Each container stores one name alongside the data, normally just the
+    source file's base name. Callers that walk a directory tree can pass a
+    relative path as `embedded_name` instead, so `decrypt_file` recreates
+    the original subdirectories under its export directory.
     """
 
     def __init__(self, key: str):
@@ -132,6 +167,7 @@ class Crp:
         file_name: str = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         compress: bool = True,
+        embedded_name: str = None,
     ) -> str:
         """
         Streams, (optionally) compresses, and encrypts a file into a .crp
@@ -141,12 +177,18 @@ class Crp:
             path (str): Path of the file to encrypt.
             export_dir_path (str, optional): Directory to write the .crp file
                 into. Defaults to 'crp-files/'.
-            file_name (str, optional): Name to give the .crp file. Defaults to
-                the source file's name with a .crp extension.
+            file_name (str, optional): Name to give the .crp file on disk.
+                Defaults to the source file's base name with a .crp extension.
             chunk_size (int, optional): Target plaintext chunk size, in bytes,
                 before each chunk is encrypted. Defaults to 1 MiB.
             compress (bool, optional): Whether to zlib-compress the data
                 before encrypting it. Defaults to True.
+            embedded_name (str, optional): The name (or relative path, for
+                recreating a directory tree on decrypt) stored inside the
+                container and restored by `decrypt_file`. Defaults to the
+                source file's base name. Callers that mirror a directory
+                tree pass a relative path here, e.g. "docs/notes.txt";
+                `file_name` and the on-disk layout are unaffected by this.
 
         Returns:
             str: The path of the written .crp file.
@@ -166,6 +208,7 @@ class Crp:
             raise ValueError('chunk_size must be a positive integer.')
 
         source_name = os.path.basename(path)
+        stored_name = embedded_name or source_name
 
         if file_name:
             base_name, current_ext = os.path.splitext(file_name)
@@ -182,7 +225,7 @@ class Crp:
         key = _derive_key(self.__key, salt)
         aead = AESGCM(key)
 
-        metadata = _pack_metadata(source_name)
+        metadata = _pack_metadata(stored_name)
         source = _compressed_source(path, metadata) if compress else _raw_source(path, metadata)
 
         with open(out_path, 'wb') as out:
@@ -223,7 +266,9 @@ class Crp:
             export_dir_path (str, optional): Directory to write the decrypted
                 file into. Defaults to 'files/'.
             file_name (str, optional): Name to give the decrypted file.
-                Defaults to the name stored inside the .crp file.
+                Defaults to the name (or relative path) stored inside the
+                .crp file; any subdirectories it implies are created under
+                export_dir_path.
 
         Returns:
             str: The path of the written, decrypted file.
@@ -231,7 +276,8 @@ class Crp:
         Raises:
             ValueError: If the path is empty.
             FileNotFoundError: If the file does not exist or isn't a .crp file.
-            CorruptedFile: If the container is malformed or truncated.
+            CorruptedFile: If the container is malformed, truncated, or its
+                stored name would resolve outside export_dir_path.
             UnsupportedVersion: If the format version is not recognized.
             InvalidKey: If the key is wrong or the data has been tampered with.
         """
@@ -262,7 +308,15 @@ class Crp:
 
             final_name = file_name or decrypted_name
             export_dir_path = self.__ensure_dir_exists(export_dir_path or 'files/')
-            out_path = os.path.join(export_dir_path, final_name)
+
+            # The stored name may be a relative path ("docs/notes.txt") when
+            # the file was part of a directory tree encrypted with
+            # `embedded_name`; _safe_join rebuilds it under export_dir_path
+            # and refuses anything that would land outside that directory.
+            out_path = _safe_join(export_dir_path, final_name)
+            parent_dir = os.path.dirname(out_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
 
             with open(out_path, 'wb') as out:
                 if data is not None:
