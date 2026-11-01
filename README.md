@@ -1,104 +1,155 @@
-# Crp Encryption Tool 🔐
+# Pycrp
 
-Welcome to **Pycrp**, a simple yet effective command-line tool for encrypting and decrypting files using symmetric encryption 
-**[`Fernet`](https://github.com/pyca/cryptography)**. This tool is designed to protect your files with a key you provide and securely save or retrieve them from encrypted `.crp` files.
+Pycrp is a command-line tool and Python library for encrypting and decrypting files with a passphrase. It streams data through authenticated AES-256-GCM encryption in fixed-size chunks, so memory use stays bounded regardless of file size, and supports encrypting entire directory trees recursively.
 
-## Features ✨
-- **Encrypt Files**: Secure your files by encrypting them with a key.
-- **Decrypt Files**: Retrieve your encrypted files with the correct key.
-- **Simple CLI Interface**: Use easy-to-remember commands to encrypt or decrypt files in bulk.
+## Features
 
+- **Streaming, authenticated encryption.** Files are encrypted with AES-256-GCM in independently authenticated chunks. A file is never loaded into memory in full; a multi-gigabyte file takes roughly constant memory to process.
+- **Tamper detection.** Each chunk is authenticated, including its position in the stream, so a modified, reordered, or truncated `.crp` file is rejected rather than silently producing corrupted output.
+- **Password-based key derivation.** Keys are derived from the passphrase with scrypt (a memory-hard KDF) and a random salt generated per file, rather than from a bare hash of the passphrase.
+- **Optional compression.** Data can be compressed with zlib before encryption, which also reduces the plaintext redundancy exposed to the cipher.
+- **Recursive directory mode.** An entire directory tree can be encrypted or decrypted in one command, with the original folder structure preserved.
+- **Secure passphrase entry.** The passphrase is read from a hidden terminal prompt, not a command-line argument, so it never ends up in shell history or process listings. It can also be supplied through an environment variable for scripted or CI use.
+- **Optional secure deletion.** Source files can be overwritten and removed after a successful encryption with `--shred` (see the caveats below).
+- **Backward-compatible decryption.** `.crp` files produced by earlier (pre-2.0) versions of this tool remain decryptable.
 
-## Installation ⬇️
-
-To get started:
+## Installation
 
 ```bash
 pip install pycrp
 ```
 
-## Usage 🚀
+## Usage
 
-This tool provides two main commands: `enc` to encrypt files and `dec` to decrypt them.
+The tool provides two commands: `enc` to encrypt files and `dec` to decrypt them. Both operate on a directory of files at a time.
 
-### Encrypt Files 🔒
-
-To encrypt files in a directory, use the `enc` command:
+### Encrypting files
 
 ```bash
-pycrp enc <key> -d <directory> -ex <export_directory>
+pycrp enc --dir <directory> --export <export_directory>
 ```
 
-- `<key>`: The encryption key.
-- `-d <directory>`: The directory where the files to encrypt are located. If omitted, it defaults to the current directory.
-- `-ex <export_directory>`: The directory where the encrypted `.crp` files will be saved. If omitted, it defaults to `crp-files/`.
+You will be prompted for a passphrase twice, to catch typing mistakes before they lock you out of your own files. Options:
+
+- `-d, --dir <directory>`: Directory containing the files to encrypt. Defaults to the current directory.
+- `-ex, --export <directory>`: Directory to write the encrypted `.crp` files into. Created automatically if it does not exist. Defaults to `crp-files/`.
+- `-r, --recursive`: Also encrypt files in subdirectories, mirroring the folder structure under the export directory.
+- `--shred`: Overwrite and permanently delete each source file once it has been encrypted. Prompts for confirmation unless `-y/--yes` is also given.
+- `--shred-passes <n>`: Number of overwrite passes before deletion (default: 3). Has no effect without `--shred`.
+- `-y, --yes`: Skip the `--shred` confirmation prompt.
+- `-k, --key <passphrase>`: Supply the passphrase directly instead of being prompted. Only recommended for scripted use; see **Non-interactive use** below for a safer alternative.
 
 Example:
 
 ```bash
-pycrp enc "my-secret-key" -d ./myfiles -ex ./encrypted-files
+pycrp enc --dir ./myfiles --export ./encrypted-files --recursive
 ```
 
-### Decrypt Files 🔓
-
-To decrypt previously encrypted `.crp` files, use the `dec` command:
+### Decrypting files
 
 ```bash
-pycrp dec <key> -d <directory> -ex <export_directory>
+pycrp dec --dir <directory> --export <export_directory>
 ```
 
-- `<key>`: The decryption key (must be the same key used to encrypt the files).
-- `-d <directory>`: The directory where the `.crp` files are located. Defaults to the current directory if omitted.
-- `-ex <export_directory>`: The directory where the decrypted files will be saved. Defaults to `files/`.
+You will be prompted for the passphrase once (no confirmation, since typing a wrong passphrase twice confirms nothing). Options mirror `enc`'s `-d`, `-ex`, `-r`, and `-k`; `--shred` and `--shred-passes` do not apply to decryption.
 
 Example:
 
 ```bash
-pycrp dec "my-secret-key" -d ./encrypted-files -ex ./decrypted-files
+pycrp dec --dir ./encrypted-files --export ./decrypted-files --recursive
 ```
 
+### Non-interactive use
 
-## Code Overview 🛠️
+For scripts or CI pipelines, set the `PYCRP_KEY` environment variable instead of using `-k` or the interactive prompt:
 
-### `Crp` Class
+```bash
+export PYCRP_KEY="my-passphrase"
+pycrp enc --dir ./myfiles --export ./encrypted-files
+```
 
-The `Crp` class provides all the core functionality:
+An environment variable is generally a better fit for automation than a command-line argument: it does not appear in shell history, and most CI systems can mask variables flagged as secrets in their logs.
 
-- **`__init__(key: str)`**: Initializes the encryption/decryption object with a specified key.
-- **`encrypt( bytes) -> bytes`**: Encrypts byte data using the Fernet symmetric encryption.
-- **`decrypt( bytes) -> bytes`**: Decrypts previously encrypted byte data.
-- **`load_file(path: str)`**: Loads the file data to prepare it for encryption.
-- **`dump_crp(file_name: str = None, export_dir_path: str = None)`**: Saves the encrypted data to a `.crp` file.
-- **`load_crp(path: str)`**: Loads and decrypts a `.crp` file.
-- **`dump_file(file_name: str = None, export_dir_path: str = None)`**: Saves the decrypted data to a file.
+### Batch output
 
-### Example Usage in Python 🐍
+Both commands print a per-file status line as each file is processed, followed by a short summary once the batch finishes:
 
-Here's how to use the `Crp` class in your Python code for encrypting and decrypting a file:
+```
+--- 3 file(s) processed ---
+Decrypted: 1
+Wrong key: 1
+    other.crp
+Corrupted or unsupported: 1
+    broken.crp (Truncated chunk data.)
+```
+
+## Python API
 
 ```python
 from pycrp import Crp
 
-# Initialize with an encryption key
-key = "my-secret-key"
-crp = Crp(key)
+crp = Crp("my-passphrase")
 
 # Encrypt a file
-file_path = "path/to/your/file.txt"
-crp.load_file(file_path)
-encrypted_path = crp.dump_crp(export_dir_path="encrypted_files")
-print(f"File encrypted and saved to {encrypted_path}")
+encrypted_path = crp.encrypt_file("path/to/file.txt", export_dir_path="encrypted_files")
 
-# Decrypt the previously encrypted file
-crp.load_crp(encrypted_path)
-decrypted_path = crp.dump_file(export_dir_path="decrypted_files")
-print(f"File decrypted and saved to {decrypted_path}")
+# Decrypt it back
+decrypted_path = crp.decrypt_file(encrypted_path, export_dir_path="decrypted_files")
 ```
 
-## Contributing 🤝
+`encrypt_file` and `decrypt_file` stream to and from disk directly; neither loads a whole file into memory. Relevant parameters:
 
-Feel free to open issues and submit pull requests. Contributions are welcome!
+- `encrypt_file(path, export_dir_path=None, file_name=None, chunk_size=1048576, compress=True, embedded_name=None, progress_callback=None)`
+- `decrypt_file(path, export_dir_path=None, file_name=None, progress_callback=None)`
 
-## License 📄
+`embedded_name` stores a name (optionally a relative path, e.g. `"docs/notes.txt"`) inside the container, which `decrypt_file` uses to recreate the original location under its export directory; this is how recursive mode preserves directory structure. A name that would resolve outside the export directory is rejected.
 
-This project is licensed under the MIT License.
+Secure deletion is available as a standalone function:
+
+```python
+from pycrp import secure_delete
+
+secure_delete("path/to/file.txt", passes=3)
+```
+
+### Exceptions
+
+- `InvalidKey`: the passphrase is wrong, or the data has been tampered with.
+- `CorruptedFile`: the `.crp` container is malformed, truncated, or its stored name would escape the export directory.
+- `UnsupportedVersion`: the file was produced by an incompatible format version.
+- `ShredError`: a file could not be overwritten or removed during secure deletion.
+
+## File format
+
+A `.crp` file stores a 4-byte magic value, a 1-byte format version, and then version-specific fields: a random salt for key derivation, a random nonce prefix, the chunk size used, a compression flag, and a sequence of length-prefixed, independently authenticated ciphertext chunks. Each chunk's authentication covers both its position in the file and whether it is the final chunk, so truncating or reordering the file is detected rather than silently accepted.
+
+## On secure deletion (`--shred`)
+
+Overwriting a file's bytes before deleting it is a real improvement over a plain delete, which only removes the file's directory entry and leaves its data on disk untouched. It is not, however, a guarantee on every kind of storage:
+
+- On SSDs, wear-leveling means a logical overwrite is often written to different physical cells than the original data occupied; the original cells persist until the drive reclaims them on its own schedule.
+- Copy-on-write filesystems (Btrfs, ZFS, APFS) never overwrite a block in place; a "changed" file is a new set of blocks, with the old ones reachable until a snapshot or the filesystem frees them.
+- A file that has already been backed up, synced, or snapshotted has copies this tool has no way to find or affect.
+
+If your threat model includes forensic recovery from SSD or copy-on-write storage, full-disk encryption is the more reliable tool. `--shred` is still worth using on top of that, and on conventional filesystems over spinning disks it is meaningfully more thorough than a plain delete.
+
+## Compatibility
+
+Files encrypted with versions of this tool prior to 2.0.0 (which encrypted a whole file at once with Fernet, without chunking) remain decryptable with the current version. New files are always written in the current streaming format.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+The test suite includes integration tests, marked `integration`, that exercise larger files and tampered or truncated containers; run `pytest -m "not integration"` to skip them for a faster feedback loop during development.
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+## License
+
+MIT License.

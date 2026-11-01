@@ -59,3 +59,9 @@ HEADER_SIZE_V2 = (
 DEFAULT_CHUNK_SIZE = 1024 * 1024   # 1 MiB plaintext chunk before encryption
 READ_BLOCK_SIZE = 64 * 1024        # 64 KiB blocks used to read the source file
 MAX_CHUNK_INDEX = 2 ** 32 - 1      # counter is a 4-byte big-endian integer
+
+# A plain pass of random bytes is, in practice, as effective as many on
+# modern drives (see shred.py for why "secure" overwrite has limits in the
+# first place); three passes matches the traditional random/random/zero
+# pattern without pretending more buys meaningfully more.
+DEFAULT_SHRED_PASSES = 3

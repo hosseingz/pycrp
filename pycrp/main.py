@@ -1,7 +1,7 @@
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.exceptions import InvalidTag
 from base64 import urlsafe_b64encode
 
 from .exceptions import InvalidKey, CorruptedFile, UnsupportedVersion
@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 import os
 import struct
 import zlib
+
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -99,21 +100,29 @@ class _ChunkedByteReader:
         return chunk, is_last
 
 
-def _raw_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE):
-    """Yields metadata first, then the source file's content in fixed-size blocks."""
+def _raw_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE, progress_callback=None):
+    """
+    Yields metadata first, then the source file's content in fixed-size
+    blocks. `progress_callback`, if given, is called with the number of
+    file bytes just read, so callers can track progress against the
+    source file's size on disk regardless of what happens to the data
+    afterwards (compression, chunking, encryption).
+    """
     yield metadata
     with open(path, 'rb') as file:
         while True:
             block = file.read(read_block)
             if not block:
                 break
+            if progress_callback is not None:
+                progress_callback(len(block))
             yield block
 
 
-def _compressed_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE):
+def _compressed_source(path: str, metadata: bytes, read_block: int = READ_BLOCK_SIZE, progress_callback=None):
     """Like `_raw_source`, but streamed through a zlib compressor as it is read."""
     compressor = zlib.compressobj()
-    for block in _raw_source(path, metadata, read_block):
+    for block in _raw_source(path, metadata, read_block, progress_callback):
         data = compressor.compress(block)
         if data:
             yield data
@@ -168,6 +177,7 @@ class Crp:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         compress: bool = True,
         embedded_name: str = None,
+        progress_callback=None,
     ) -> str:
         """
         Streams, (optionally) compresses, and encrypts a file into a .crp
@@ -189,6 +199,10 @@ class Crp:
                 source file's base name. Callers that mirror a directory
                 tree pass a relative path here, e.g. "docs/notes.txt";
                 `file_name` and the on-disk layout are unaffected by this.
+            progress_callback (callable, optional): Called with the number
+                of source file bytes read each time a block is consumed,
+                e.g. `lambda n: bar.update(n)`. Reflects actual I/O against
+                `path`, not the (possibly much smaller) compressed size.
 
         Returns:
             str: The path of the written .crp file.
@@ -226,7 +240,10 @@ class Crp:
         aead = AESGCM(key)
 
         metadata = _pack_metadata(stored_name)
-        source = _compressed_source(path, metadata) if compress else _raw_source(path, metadata)
+        if compress:
+            source = _compressed_source(path, metadata, progress_callback=progress_callback)
+        else:
+            source = _raw_source(path, metadata, progress_callback=progress_callback)
 
         with open(out_path, 'wb') as out:
             out.write(MAGIC)
@@ -255,6 +272,7 @@ class Crp:
         path: str,
         export_dir_path: str = None,
         file_name: str = None,
+        progress_callback=None,
     ) -> str:
         """
         Streams and decrypts a .crp file back to its original content
@@ -269,6 +287,12 @@ class Crp:
                 Defaults to the name (or relative path) stored inside the
                 .crp file; any subdirectories it implies are created under
                 export_dir_path.
+            progress_callback (callable, optional): Called with the number
+                of bytes just read from `path`, so progress tracks against
+                its size on disk (known upfront, unlike the decrypted size).
+                For a legacy v1 container, which has no per-chunk structure,
+                it is called once with the remaining file size after the
+                whole thing has been read.
 
         Returns:
             str: The path of the written, decrypted file.
@@ -299,9 +323,9 @@ class Crp:
             version = version_byte[0]
 
             if version == VERSION_LEGACY:
-                decrypted_name, data = self.__decrypt_legacy_v1(inp)
+                decrypted_name, data = self.__decrypt_legacy_v1(inp, progress_callback)
             elif version == VERSION_STREAM:
-                decrypted_name, data_iter = self.__open_stream_v2(inp)
+                decrypted_name, data_iter = self.__open_stream_v2(inp, progress_callback)
                 data = None  # written straight to disk below
             else:
                 raise UnsupportedVersion(f'Unsupported .crp format version: {version}')
@@ -328,7 +352,7 @@ class Crp:
         return out_path
 
     # v2 (streaming) decryption internals
-    def __open_stream_v2(self, inp):
+    def __open_stream_v2(self, inp, progress_callback=None):
         """
         Parses a v2 header from an already-open file object positioned right
         after the version byte, and returns (file_name, data_blocks_iterator).
@@ -370,6 +394,8 @@ class Crp:
                 ciphertext = inp.read(clen)
                 if len(ciphertext) != clen:
                     raise CorruptedFile('Truncated chunk data.')
+                if progress_callback is not None:
+                    progress_callback(CHUNK_LEN_FIELD_SIZE + clen)
 
                 next_len_bytes = inp.read(CHUNK_LEN_FIELD_SIZE)
                 is_last = len(next_len_bytes) == 0
@@ -425,10 +451,12 @@ class Crp:
         return name_box['name'], chained()
 
     # v1 (legacy, whole-file) decryption internals
-    def __decrypt_legacy_v1(self, inp):
+    def __decrypt_legacy_v1(self, inp, progress_callback=None):
         """
         Decrypts a legacy (task 1) whole-file Fernet container. Reads the
         rest of the file into memory, since that format predates chunking.
+        There is no per-chunk structure to report progress against, so
+        `progress_callback`, if given, only fires once, after this read.
         """
 
         rest_of_header = inp.read(HEADER_SIZE_V1 - len(MAGIC) - 1)
@@ -437,6 +465,8 @@ class Crp:
 
         salt = rest_of_header
         token = inp.read()
+        if progress_callback is not None:
+            progress_callback(len(token))
 
         raw_key = _derive_key(self.__key, salt)
         fernet_key = urlsafe_b64encode(raw_key)
